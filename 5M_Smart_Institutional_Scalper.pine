@@ -1,0 +1,180 @@
+//@version=5
+indicator("5M TradingView Instant Price & Volume Shock News Scalper", overlay=true, max_labels_count=500)
+
+// ==========================================
+// 1. TIMEFRAME GUARD & SETTINGS
+// ==========================================
+enforce5m = input.bool(true, "5M Timeframe Guard", group="General Settings")
+if enforce5m and timeframe.period != "5"
+    runtime.error("??? Script ?? 5M Chart ?? ???? ????! (Settings ????? ??????? ?? ???)")
+
+// ==========================================
+// 2. INPUT SETTINGS: SHOCK DETECTION
+// ==========================================
+// --- Instant Shock Sensitivities ---
+shockRangeAtrMult = input.float(1.5, "Price Range Shock (ATR Multiplier)", minval=1.1, maxval=4.0, group="Price & Volume Shock Filters")
+shockVolMult      = input.float(2.0, "Volume Surge Shock (SMA 20 Multiplier)", minval=1.2, maxval=5.0, group="Price & Volume Shock Filters")
+deltaRatioReq     = input.float(0.65, "Min Directional Pressure (65% Bull/Bear)", minval=0.50, maxval=0.90, group="Price & Volume Shock Filters")
+
+// --- Visual Options ---
+showDashboard     = input.bool(true, "Show Live News Shock Dashboard", group="Visuals")
+dashPosition      = input.string("Top Right", "Dashboard Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group="Visuals")
+
+color c_green     = color.rgb(0, 230, 118)
+color c_red       = color.rgb(255, 23, 68)
+color c_gold      = color.rgb(255, 215, 0)
+
+// ==========================================
+// 3. CORE PRICE & VOLUME SHOCK CALCULATIONS
+// ==========================================
+volMa      = ta.sma(volume, 20)
+atr14      = ta.atr(14)
+cRange     = (high - low == 0) ? syminfo.mintick : (high - low)
+bodyLen    = math.abs(close - open)
+
+// 1. Instant Volume Surge Shock
+hasVol     = not na(volume) and volume > 0
+isVolShock = not hasVol or (volume >= volMa * shockVolMult)
+
+// 2. Instant Price Expansion Shock (Violent Candle Breakout)
+isPriceShock = cRange >= (atr14 * shockRangeAtrMult)
+
+// 3. Directional Order Flow Delta Shock
+buyVolume  = volume * (close - low) / cRange
+sellVolume = volume * (high - close) / cRange
+totalVol   = buyVolume + sellVolume == 0 ? 1.0 : (buyVolume + sellVolume)
+
+bullishDeltaRatio = buyVolume / totalVol
+bearishDeltaRatio = sellVolume / totalVol
+
+// ==========================================
+// 4. EXACT NEWS EVENT IDENTIFICATION (UTC TIME)
+// ==========================================
+f_get_news_name() =>
+    h = hour(time, "UTC")
+    m = minute(time, "UTC")
+    d = dayofmonth(time, "UTC")
+    w = dayofweek(time, "UTC") // 6=Fri, 4=Wed, 5=Thu, 3=Tue
+    
+    string nName = "HIGH-IMPACT NEWS"
+    
+    // 1. NFP (Non-Farm Payroll) - 1st Friday (12:00 - 14:00 UTC)
+    if w == 6 and d <= 7 and (h == 12 or h == 13)
+        nName := "NFP"
+    
+    // 2. US CPI (Inflation) - 2nd/3rd Week Tue/Wed (12:00 - 14:00 UTC)
+    else if (w == 3 or w == 4) and (d >= 10 and d <= 16) and (h == 12 or h == 13)
+        nName := "CPI"
+        
+    // 3. FOMC Fed Interest Rate Decision - Wednesday (18:00 - 20:00 UTC)
+    else if w == 4 and (h == 18 or h == 19)
+        nName := "FOMC"
+        
+    // 4. US GDP / PPI / Core PCE / Jobless Claims - Thursday (12:30 / 13:30 UTC)
+    else if w == 5 and (h == 12 or h == 13)
+        nName := "US-DATA (GDP/PPI)"
+        
+    // 5. ECB / BOE Interest Rate Decision (11:00 - 13:00 UTC)
+    else if (w == 4 or w == 5) and (h >= 11 and h <= 13)
+        nName := "ECB/BOE"
+        
+    // 6. US NYSE Cash Open Impulse (13:30 - 14:30 UTC)
+    else if (h == 13 and m >= 30) or (h == 14)
+        nName := "NY OPEN"
+        
+    // 7. London Session Open Volatility (07:00 - 08:30 UTC)
+    else if (h == 7 or h == 8)
+        nName := "LONDON OPEN"
+        
+    // 8. Asian / BOJ Releases (00:30 - 04:30 UTC)
+    else if (h >= 0 and h <= 4)
+        nName := "ASIA/BOJ"
+        
+    nName
+
+// ==========================================
+// 5. SHOCK SIGNAL GENERATION (INSTANT SHOCK RESULT)
+// ==========================================
+// Instant Bullish Shock: Price range surge + volume spike + strong green body
+bullShock = isPriceShock and isVolShock and (close > open) and (bullishDeltaRatio >= deltaRatioReq)
+
+// Instant Bearish Shock: Price range surge + volume spike + strong red body (Like NFP giant red drop)
+bearShock = isPriceShock and isVolShock and (close < open) and (bearishDeltaRatio >= deltaRatioReq)
+
+// Anti-Spam state machine
+var int lastDirection = 0 // 1 = Buy, -1 = Sell
+var string activeNewsName = "NONE"
+var string lastSignalDisplay = "NONE"
+
+validShockBuy  = barstate.isconfirmed and bullShock and (lastDirection != 1)
+validShockSell = barstate.isconfirmed and bearShock and (lastDirection != -1)
+
+if validShockBuy
+    lastDirection     := 1
+    activeNewsName    := f_get_news_name()
+    lastSignalDisplay := "? " + activeNewsName + " SHOCK BUY"
+
+if validShockSell
+    lastDirection     := -1
+    activeNewsName    := f_get_news_name()
+    lastSignalDisplay := "? " + activeNewsName + " SHOCK SELL"
+
+// ==========================================
+// 6. VISUALS: CANDLE HIGHLIGHTS & SHOCK LABELS
+// ==========================================
+// Color Shock Candle Gold
+barcolor(validShockBuy or validShockSell or (isPriceShock and isVolShock) ? c_gold : na)
+
+// Direct Sharp Signal Labels
+if validShockBuy
+    label.new(bar_index, low, text="? " + activeNewsName + " BUY\n(Shock Surge: " + str.tostring(math.round(volume/volMa, 1)) + "x Vol)",
+              color=c_green, textcolor=color.black, style=label.style_label_up, size=size.normal)
+
+if validShockSell
+    label.new(bar_index, high, text="? " + activeNewsName + " SELL\n(Shock Surge: " + str.tostring(math.round(volume/volMa, 1)) + "x Vol)",
+              color=c_red, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// Baseline 50 EMA Plot
+ema50 = ta.ema(close, 50)
+plot(ema50, "Baseline EMA 50", color=color.new(color.purple, 30), linewidth=2)
+
+// ==========================================
+// 7. ON-SCREEN LIVE NEWS SHOCK DASHBOARD (HUD)
+// ==========================================
+var table dash = na
+
+if showDashboard and barstate.islast
+    tablePos = dashPosition == "Top Right" ? position.top_right :
+               dashPosition == "Bottom Right" ? position.bottom_right :
+               dashPosition == "Top Left" ? position.top_left : position.bottom_left
+               
+    dash := table.new(tablePos, 2, 5, bgcolor=color.new(#131722, 10), border_color=color.new(color.gray, 60), border_width=1)
+    
+    // Header
+    table.cell(dash, 0, 0, "PRICE & VOLUME SHOCK HUD", bgcolor=color.new(#2962FF, 20), text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "LIVE STATUS", bgcolor=color.new(#2962FF, 20), text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    
+    // 1. Current Session/News
+    table.cell(dash, 0, 1, "Active Market Session", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1, f_get_news_name(), text_color=c_gold, text_size=size.small, text_halign=text.align_center)
+    
+    // 2. Instant Volume Surge
+    table.cell(dash, 0, 2, "Volume Surge Shock", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    volX = math.round(volume / volMa, 1)
+    table.cell(dash, 1, 2, str.tostring(volX) + "x Volume Surge", text_color=volX >= shockVolMult ? c_gold : color.white, text_size=size.small, text_halign=text.align_center)
+    
+    // 3. Price ATR Range Surge
+    table.cell(dash, 0, 3, "Price Range Shock", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    rangeX = math.round(cRange / atr14, 1)
+    table.cell(dash, 1, 3, str.tostring(rangeX) + "x ATR Range", text_color=rangeX >= shockRangeAtrMult ? c_gold : color.white, text_size=size.small, text_halign=text.align_center)
+
+    // 4. Last Confirmed Shock Signal
+    table.cell(dash, 0, 4, "Last News Signal", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    sigCol = str.contains(lastSignalDisplay, "BUY") ? c_green : str.contains(lastSignalDisplay, "SELL") ? c_red : color.gray
+    table.cell(dash, 1, 4, lastSignalDisplay, text_color=sigCol, text_size=size.small, text_halign=text.align_center)
+
+// ==========================================
+// 8. ALERTS (NON-REPAINTING)
+// ==========================================
+alertcondition(validShockBuy, title="Instant News Shock BUY Signal", message="? {{ticker}} INSTANT NEWS SHOCK BUY! Event: {{close}}")
+alertcondition(validShockSell, title="Instant News Shock SELL Signal", message="? {{ticker}} INSTANT NEWS SHOCK SELL! Event: {{close}}")

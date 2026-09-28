@@ -1,0 +1,30 @@
+{
+  "discord": {
+    "enabled": true,
+    "webhook_url": "https://discord.com/api/webhooks/1554164087225716882/09uhzYVps86mrAPCY1QjFAxZHe3ilCHtxT2e6noWoMar-0F06HkUsglghcNEgmHoGkvM",
+    "bot_name": "Sandun Madusanka (Trader/Fundamental Trader)",
+    "avatar_url": "https://cdn.discordapp.com/avatars/1554164087225716882/b9f281dece62a511617dc918c5154d13.png"
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": "8458840341:AAGs5T9c2i3TMlQ1ZCF6evCc9U8QwRXDwJU",
+    "chat_id": "7441861904",
+    "goldflow_channel_id": "-1003731014085"
+  },
+  "trading": {
+    "target_currencies": ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"],
+    "min_impact": "High",
+    "enable_breaking_war_news": true,
+    "enable_daily_orderflow_analysis": true,
+    "daily_analysis_utc_hour": 21,
+    "daily_analysis_utc_minute": 0,
+    "enable_daily_news_schedule": true,
+    "enable_us_holiday_alerts": true,
+    "daily_schedule_utc_hour": 0,
+    "daily_schedule_utc_minute": 0,
+    "pre_news_alert_minutes": [15, 5],
+    "breaking_news_poll_interval_seconds": 600,
+    "auto_poll_interval_seconds": 25,
+    "news_release_fast_poll_seconds": 4
+  }
+}
