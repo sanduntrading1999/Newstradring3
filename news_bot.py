@@ -4,12 +4,17 @@ import json
 import os
 import requests
 import threading
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from colorama import init, Fore, Style
 from tabulate import tabulate
+import discord
+from discord.ext import commands
+from discord import app_commands
 from news_scraper import ForexNewsScraper
 from orderflow_analyzer import OrderflowMSNRAnalyzer
+from voice_engine import DiscordVoiceManager
 
 init(autoreset=True)
 
@@ -28,9 +33,19 @@ class AllCurrencyAndGoldNewsBot:
         self.last_daily_schedule_date = None
         self.last_holiday_alert_date = None
         
+        # Discord Voice State
+        self.voice_manager = None
+        self.discord_loop = None
+        
         self.executor = ThreadPoolExecutor(max_workers=50)
         
-        threading.Thread(target=self.listen_for_subscribers, daemon=True).start()
+        # Start Discord Interactive Bot if enabled
+        if self.config.get("discord", {}).get("enabled", True):
+            threading.Thread(target=self.start_discord_bot, daemon=True).start()
+
+        # Start Telegram Subscriber Listener if enabled
+        if self.config.get("telegram", {}).get("enabled", False):
+            threading.Thread(target=self.listen_for_subscribers, daemon=True).start()
         
         if self.config.get("trading", {}).get("enable_breaking_war_news", True):
             threading.Thread(target=self.monitor_breaking_war_news, daemon=True).start()
@@ -44,7 +59,20 @@ class AllCurrencyAndGoldNewsBot:
     def load_config(self, path):
         if not os.path.exists(path):
             return {
-                "telegram": {"enabled": True, "bot_token": "", "chat_id": ""},
+                "discord": {
+                    "enabled": True,
+                    "bot_token": "",
+                    "webhook_url": "",
+                    "voice_enabled": True,
+                    "voice_channel_id": "",
+                    "auto_join_voice": True,
+                    "voice_language": "both",
+                    "voice_name_en": "en-US-ChristopherNeural",
+                    "voice_name_si": "si-LK-SameeraNeural",
+                    "bot_name": "GoldFlow FX News & Orderflow Bot",
+                    "avatar_url": "https://cdn.discordapp.com/avatars/1554164087225716882/b9f281dece62a511617dc918c5154d13.png"
+                },
+                "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
                 "trading": {
                     "target_currencies": ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"],
                     "min_impact": "High",
@@ -52,7 +80,7 @@ class AllCurrencyAndGoldNewsBot:
                     "enable_daily_orderflow_analysis": True,
                     "daily_analysis_utc_hour": 21,
                     "daily_analysis_utc_minute": 0,
-                    "enable_daily_news_schedule": true,
+                    "enable_daily_news_schedule": True,
                     "daily_schedule_utc_hour": 0,
                     "daily_schedule_utc_minute": 0,
                     "pre_news_alert_minutes": [15, 5],
@@ -85,6 +113,241 @@ class AllCurrencyAndGoldNewsBot:
                 json.dump(list(self.subscribers), f, indent=2)
         except Exception as e:
             print(f"[!] Error saving subscribers: {e}")
+
+    def announce_voice(self, text_en: str = None, text_si: str = None):
+        """Asynchronously queues live Voice TTS speech to the Discord Voice Channel"""
+        if not self.config.get("discord", {}).get("voice_enabled", True):
+            return
+        if self.voice_manager and self.discord_loop and self.discord_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.voice_manager.queue_speech(text_en, text_si),
+                self.discord_loop
+            )
+
+    def start_discord_bot(self):
+        """Starts Discord Client with full Interactive Slash Commands, Prefix Commands, and Live Voice Room TTS"""
+        token = self.config.get("discord", {}).get("bot_token", "").strip()
+        if not token:
+            print(Fore.YELLOW + "[*] Discord bot_token is not set in config.json. Webhook broadcasting active (Add bot_token to enable /commands and Voice Channel TTS).")
+            return
+
+        intents = discord.Intents.default()
+        try:
+            intents.message_content = True
+        except Exception:
+            pass
+
+        client = commands.Bot(command_prefix=["!", "/"], intents=intents, help_command=None)
+        self.voice_manager = DiscordVoiceManager(client, self.config)
+
+        def build_embed(title, html_content, color=0x3498DB):
+            clean_desc = self.html_to_discord(html_content)
+            bot_name = self.config.get("discord", {}).get("bot_name", "GoldFlow FX News & Orderflow Bot")
+            avatar_url = self.config.get("discord", {}).get("avatar_url", "https://cdn.discordapp.com/avatars/1554164087225716882/b9f281dece62a511617dc918c5154d13.png")
+            embed = discord.Embed(
+                title=title,
+                description=clean_desc[:4000],
+                color=color,
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.set_author(name=bot_name, icon_url=avatar_url)
+            embed.set_footer(text="🎯 Developer: Sandun Madusanka (Trader / Fundamental Trader)")
+            return embed
+
+        @client.event
+        async def on_ready():
+            print(Fore.GREEN + Style.BRIGHT + f"\n[+] Discord Bot Connected as {client.user} (ID: {client.user.id}) 🟢")
+            try:
+                synced = await client.tree.sync()
+                print(Fore.GREEN + f"[+] Synced {len(synced)} Discord Application Slash Commands successfully.")
+            except Exception as e:
+                print(Fore.YELLOW + f"[!] Discord Slash Sync Notice: {e}")
+
+            # Auto-join configured Discord Voice Channel
+            vc_id = self.config.get("discord", {}).get("voice_channel_id")
+            if vc_id and self.config.get("discord", {}).get("auto_join_voice", True):
+                try:
+                    chan = client.get_channel(int(vc_id))
+                    if not chan:
+                        chan = await client.fetch_channel(int(vc_id))
+                    if chan and isinstance(chan, discord.VoiceChannel):
+                        await self.voice_manager.join_channel(chan)
+                except Exception as e:
+                    print(Fore.YELLOW + f"[!] Discord Auto-join voice warning: {e}")
+
+        # --- Slash Commands (/today, /week, /holiday, /gold, /analysis, /join, /leave, /speak, /help) ---
+        @client.tree.command(name="today", description="Today's High-Impact News & US Bank Holiday schedule")
+        async def slash_today(interaction: discord.Interaction):
+            await interaction.response.defer()
+            msg = self.scraper.get_daily_schedule_message()
+            embed = build_embed("📅 TODAY'S HIGH-IMPACT NEWS SCHEDULE", msg, color=0x3498DB)
+            await interaction.followup.send(embed=embed)
+
+        @client.tree.command(name="week", description="Full Weekly High-Impact Calendar Schedule")
+        async def slash_week(interaction: discord.Interaction):
+            await interaction.response.defer()
+            msg = self.scraper.get_weekly_schedule_message()
+            embed = build_embed("📅 WEEKLY HIGH-IMPACT NEWS CALENDAR", msg, color=0x3498DB)
+            await interaction.followup.send(embed=embed)
+
+        @client.tree.command(name="holiday", description="US Bank Holiday & Market Early Close Times")
+        async def slash_holiday(interaction: discord.Interaction):
+            await interaction.response.defer()
+            msg = self.scraper.get_us_bank_holiday_message()
+            embed = build_embed("🏦 US BANK HOLIDAY & MARKET SCHEDULE", msg, color=0xF1C40F)
+            await interaction.followup.send(embed=embed)
+
+        @client.tree.command(name="gold", description="Gold (XAUUSD) & USD upcoming high-impact dates")
+        async def slash_gold(interaction: discord.Interaction):
+            await interaction.response.defer()
+            gold_sched = self.scraper.get_weekly_schedule_message(currencies=["USD"])
+            embed = build_embed("🏆 GOLD (XAUUSD) & USD UPCOMING DATES", gold_sched, color=0xF1C40F)
+            await interaction.followup.send(embed=embed)
+
+        @client.tree.command(name="analysis", description="Generate live Daily MSNR & Orderflow Report")
+        async def slash_analysis(interaction: discord.Interaction):
+            await interaction.response.defer()
+            sh_rep, en_rep = self.orderflow_analyzer.generate_daily_reports()
+            if sh_rep and en_rep:
+                embed_sh = build_embed("📊 DAILY MSNR / ORDERFLOW REPORT (SINHALA)", sh_rep, color=0xF1C40F)
+                embed_en = build_embed("📊 DAILY MSNR / ORDERFLOW REPORT (ENGLISH)", en_rep, color=0x3498DB)
+                await interaction.followup.send(embeds=[embed_sh, embed_en])
+            else:
+                await interaction.followup.send("⚠️ Could not generate daily report at this moment.")
+
+        @client.tree.command(name="join", description="Join your current Discord Voice Channel (Live Voice Trading Room)")
+        async def slash_join(interaction: discord.Interaction):
+            if interaction.user.voice and interaction.user.voice.channel:
+                channel = interaction.user.voice.channel
+                await self.voice_manager.join_channel(channel)
+                await interaction.response.send_message(f"🎙️ Connected to **{channel.name}**! Live Voice Announcements are now active.")
+            else:
+                await interaction.response.send_message("⚠️ Please connect to a Voice Channel first before using `/join`.", ephemeral=True)
+
+        @client.tree.command(name="leave", description="Disconnect bot from Discord Voice Channel")
+        async def slash_leave(interaction: discord.Interaction):
+            await self.voice_manager.leave_channel()
+            await interaction.response.send_message("👋 Disconnected from Voice Channel.")
+
+        @client.tree.command(name="speak", description="Speak custom text in the Voice Channel (Test Voice TTS)")
+        @app_commands.describe(text="The message to speak", lang="Language: en (English), si (Sinhala), both (Sinhala + English)")
+        async def slash_speak(interaction: discord.Interaction, text: str, lang: str = "en"):
+            if not self.voice_manager.voice_client or not self.voice_manager.voice_client.is_connected():
+                await interaction.response.send_message("⚠️ Bot is not in any Voice Channel. Please join a voice channel and type `/join` first.", ephemeral=True)
+                return
+            await interaction.response.send_message(f"🗣️ Speaking in `{lang}`: *{text}*")
+            await self.voice_manager.queue_speech(text if lang in ['en', 'both'] else None, text if lang in ['si', 'both'] else None, lang_pref=lang)
+
+        @client.tree.command(name="help", description="Show all bot commands and usage guide")
+        async def slash_help(interaction: discord.Interaction):
+            help_text = (
+                "**🤖 GoldFlow FX Discord Bot Commands:**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📅 `/today` or `!today` - *Today's High-Impact News & Holiday Schedule*\n"
+                "🗓️ `/week` or `!week` - *Full Weekly High-Impact Calendar Schedule*\n"
+                "🏦 `/holiday` or `!holiday` - *US Bank Holiday & Market Early Close Times*\n"
+                "🏆 `/gold` or `!gold` - *Gold (XAUUSD) & USD Specific Events*\n"
+                "📊 `/analysis` or `!analysis` - *Instant Live MSNR & Orderflow Report*\n"
+                "🎙️ `/join` or `!join` - *Connect Bot to your Voice Channel*\n"
+                "🔇 `/leave` or `!leave` - *Disconnect Bot from Voice Channel*\n"
+                "🗣️ `/speak [text]` - *Speak test message in Voice Channel*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 *Works with both Slash Commands (`/`) and Prefix (`!`)*"
+            )
+            embed = build_embed("🤖 GOLDFLOW FX BOT COMMANDS", help_text, color=0x2ECC71)
+            await interaction.response.send_message(embed=embed)
+
+        # --- Prefix Commands (!today, !week, !holiday, !gold, !analysis, !join, !leave, !speak, !help) ---
+        @client.command(name="today", aliases=["schedule", "news"])
+        async def cmd_today(ctx):
+            msg = self.scraper.get_daily_schedule_message()
+            embed = build_embed("📅 TODAY'S HIGH-IMPACT NEWS SCHEDULE", msg, color=0x3498DB)
+            await ctx.send(embed=embed)
+
+        @client.command(name="week", aliases=["calendar"])
+        async def cmd_week(ctx):
+            msg = self.scraper.get_weekly_schedule_message()
+            embed = build_embed("📅 WEEKLY HIGH-IMPACT NEWS CALENDAR", msg, color=0x3498DB)
+            await ctx.send(embed=embed)
+
+        @client.command(name="holiday", aliases=["holidays", "us_holiday"])
+        async def cmd_holiday(ctx):
+            msg = self.scraper.get_us_bank_holiday_message()
+            embed = build_embed("🏦 US BANK HOLIDAY & MARKET SCHEDULE", msg, color=0xF1C40F)
+            await ctx.send(embed=embed)
+
+        @client.command(name="gold", aliases=["xau"])
+        async def cmd_gold(ctx):
+            gold_sched = self.scraper.get_weekly_schedule_message(currencies=["USD"])
+            embed = build_embed("🏆 GOLD (XAUUSD) & USD UPCOMING DATES", gold_sched, color=0xF1C40F)
+            await ctx.send(embed=embed)
+
+        @client.command(name="analysis", aliases=["msnr"])
+        async def cmd_analysis(ctx):
+            status_msg = await ctx.send("⏳ Generating fresh Daily MSNR & Orderflow Report...")
+            sh_rep, en_rep = self.orderflow_analyzer.generate_daily_reports()
+            if sh_rep and en_rep:
+                embed_sh = build_embed("📊 DAILY MSNR / ORDERFLOW REPORT (SINHALA)", sh_rep, color=0xF1C40F)
+                embed_en = build_embed("📊 DAILY MSNR / ORDERFLOW REPORT (ENGLISH)", en_rep, color=0x3498DB)
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                await ctx.send(embeds=[embed_sh, embed_en])
+            else:
+                await status_msg.edit(content="⚠️ Could not generate daily report at this moment.")
+
+        @client.command(name="join")
+        async def cmd_join(ctx):
+            if ctx.author.voice and ctx.author.voice.channel:
+                channel = ctx.author.voice.channel
+                await self.voice_manager.join_channel(channel)
+                await ctx.send(f"🎙️ Connected to **{channel.name}**! Live Voice Announcements active.")
+            else:
+                await ctx.send("⚠️ Please connect to a Voice Channel first before using `!join`.")
+
+        @client.command(name="leave")
+        async def cmd_leave(ctx):
+            await self.voice_manager.leave_channel()
+            await ctx.send("👋 Disconnected from Voice Channel.")
+
+        @client.command(name="speak")
+        async def cmd_speak(ctx, *, text: str = ""):
+            if not text:
+                await ctx.send("⚠️ Usage: `!speak <your text>`")
+                return
+            if not self.voice_manager.voice_client or not self.voice_manager.voice_client.is_connected():
+                await ctx.send("⚠️ Bot is not in a Voice Channel. Type `!join` first.")
+                return
+            await ctx.send(f"🗣️ Speaking: *{text}*")
+            await self.voice_manager.queue_speech(text, text, lang_pref="both")
+
+        @client.command(name="help", aliases=["start", "commands"])
+        async def cmd_help(ctx):
+            help_text = (
+                "**🤖 GoldFlow FX Discord Bot Commands:**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📅 `!today` or `/today` - *Today's High-Impact News & Holiday Schedule*\n"
+                "🗓️ `!week` or `/week` - *Full Weekly High-Impact Calendar Schedule*\n"
+                "🏦 `!holiday` or `/holiday` - *US Bank Holiday & Market Early Close Times*\n"
+                "🏆 `!gold` or `/gold` - *Gold (XAUUSD) & USD Specific Events*\n"
+                "📊 `!analysis` or `/analysis` - *Instant Live MSNR & Orderflow Report*\n"
+                "🎙️ `!join` or `/join` - *Connect Bot to your Voice Channel*\n"
+                "🔇 `!leave` or `/leave` - *Disconnect Bot from Voice Channel*\n"
+                "🗣️ `!speak [text]` - *Speak test message in Voice Channel*\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "💡 *Works with both Slash Commands (`/`) and Prefix (`!`)*"
+            )
+            embed = build_embed("🤖 GOLDFLOW FX BOT COMMANDS", help_text, color=0x2ECC71)
+            await ctx.send(embed=embed)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.discord_loop = loop
+        try:
+            loop.run_until_complete(client.start(token))
+        except Exception as e:
+            print(Fore.RED + f"[!] Discord Bot error: {e}")
 
     def listen_for_subscribers(self):
         token = self.config.get("telegram", {}).get("bot_token")
@@ -181,9 +444,6 @@ class AllCurrencyAndGoldNewsBot:
                 for item in breaking_items[:2]:
                     source = item.get("source", "GLOBAL WIRE")
                     title = item.get("title", "")
-                    gold_imp = item.get("gold_impact", "")
-                    mood = item.get("market_mood", "")
-                    explanation = item.get("gold_explanation", "")
                     link = item.get("link", "")
                     time_slt = item.get("timestamp", "")
 
@@ -203,6 +463,11 @@ class AllCurrencyAndGoldNewsBot:
                         f"{link_text}"
                     )
                     self.broadcast(news_msg, color=0xE74C3C)
+
+                    # Live Voice Announcement (English Female Voice)
+                    voice_en = f"Breaking geopolitical news alert from {source}: {title}"
+                    self.announce_voice(voice_en)
+
                     time.sleep(2)
 
             except Exception:
@@ -235,7 +500,7 @@ class AllCurrencyAndGoldNewsBot:
             return
 
         bot_name = disc_conf.get("bot_name", "GoldFlow FX News & Orderflow Bot")
-        avatar_url = disc_conf.get("avatar_url", "https://i.imgur.com/4M34hi2.png")
+        avatar_url = disc_conf.get("avatar_url", "https://cdn.discordapp.com/avatars/1554164087225716882/b9f281dece62a511617dc918c5154d13.png")
 
         discord_text = self.html_to_discord(message)
         
@@ -250,7 +515,6 @@ class AllCurrencyAndGoldNewsBot:
             else:
                 color = 0x3498DB # Blue / Default
 
-        # Discord Embed has 4096 char description limit
         payload = {
             "username": bot_name,
             "avatar_url": avatar_url,
@@ -362,6 +626,11 @@ class AllCurrencyAndGoldNewsBot:
             sched_msg = self.scraper.get_daily_schedule_message()
             print(Fore.GREEN + Style.BRIGHT + "\n[+] Broadcasting Today's High-Impact News Schedule to Discord & Telegram...")
             self.broadcast(sched_msg, color=0x3498DB)
+            
+            # Voice announcement for daily schedule (English Female Voice)
+            voice_en = "Good morning traders! Today's high impact economic news schedule has been published."
+            self.announce_voice(voice_en)
+            
             print(Fore.GREEN + "[+] Daily Schedule successfully delivered!")
 
             # If today is a US Bank Holiday and holiday alerts are enabled, send the dedicated Holiday Schedule Alert
@@ -419,7 +688,9 @@ class AllCurrencyAndGoldNewsBot:
         print(Fore.WHITE + f"[*] War/Breaking News   : " + Fore.GREEN + "ACTIVE (Financial Wire Stream 🟢)")
         print(Fore.WHITE + f"[*] Daily Gold/DXY MSNR : " + Fore.GREEN + "ACTIVE (NY Close Live MSNR/Orderflow 🟢)")
         print(Fore.WHITE + f"[*] Daily News Schedule : " + Fore.GREEN + "ACTIVE (Morning Calendar Dates Broadcast 🟢)")
-        print(Fore.WHITE + f"[*] Discord Broadcast   : {'ENABLED 🟢' if self.config.get('discord', {}).get('enabled') and self.config.get('discord', {}).get('webhook_url') else 'DISABLED ⚪'}")
+        print(Fore.WHITE + f"[*] Discord Broadcast   : {'ENABLED 🟢' if self.config.get('discord', {}).get('enabled') else 'DISABLED ⚪'}")
+        print(Fore.WHITE + f"[*] Discord Bot Commands: {'ONLINE 🟢' if self.config.get('discord', {}).get('bot_token') else 'WEBHOOK ONLY ⚪ (Add bot_token for /commands)'}")
+        print(Fore.WHITE + f"[*] Discord Live Voice  : {'ENABLED 🎙️🟢' if self.config.get('discord', {}).get('voice_enabled') else 'DISABLED ⚪'}")
         print(Fore.WHITE + f"[*] Telegram Broadcast  : {'ENABLED 🟢' if self.config.get('telegram', {}).get('enabled') else 'DISABLED ⚪'}")
         print(Fore.YELLOW + "-" * 68 + "\n")
 
@@ -467,7 +738,7 @@ class AllCurrencyAndGoldNewsBot:
                     time_slt_table = ev.get("datetime_slt", ev_time).strftime("%a %I:%M%p SLT")
                     table_data.append([country, impact, title[:26], time_slt_table, forecast, previous, status_str])
 
-                    # 1. Pre-News Warning Alert for Currency / Gold
+                    # 1. Pre-News Warning Alert for Currency / Gold (Text + Voice)
                     for pre_m in self.config["trading"].get("pre_news_alert_minutes", [15, 5]):
                         pre_key = f"{event_id}_PRE_{pre_m}"
                         if 0 <= mins_diff <= pre_m and (mins_diff > pre_m - 2) and pre_key not in self.alerted_events:
@@ -487,7 +758,12 @@ class AllCurrencyAndGoldNewsBot:
                             print(Fore.MAGENTA + Style.BRIGHT + f"\n[!] Broadcasted Pre-News Alert for {country} ({pre_m}m before {title})")
                             self.broadcast(msg, color=0xF1C40F)
 
-                    # 2. News Release Instant Result Trigger for Specific Currency
+                            # Live Discord Voice TTS Announcement (Fundamental News Alert)
+                            fc_phrase = f" Forecast is {forecast}." if forecast and forecast != "-" else ""
+                            voice_en = f"Attention traders! High impact {country} news: {title}, releasing in {pre_m} minutes.{fc_phrase}"
+                            self.announce_voice(voice_en)
+
+                    # 2. News Release Instant Result Trigger for Specific Currency (Text + Voice)
                     if actual != "" and event_id not in self.released_events:
                         self.released_events.add(event_id)
                         analysis = self.scraper.analyze_currency_impact(title, country, actual, forecast, previous)
@@ -509,6 +785,11 @@ class AllCurrencyAndGoldNewsBot:
                         )
                         self.broadcast(news_result_msg, color=0x2ECC71 if "Higher" in analysis['deviation'] else (0xE74C3C if "Lower" in analysis['deviation'] else 0x3498DB))
 
+                        # Live Discord Voice TTS Announcement (Fundamental Actual Result)
+                        clean_dev = analysis['deviation'].replace('🟢', '').replace('🔴', '').replace('⚪', '').strip()
+                        voice_en = f"{country} economic news released: {title}. Actual is {actual}, Forecast was {forecast}. Deviation is {clean_dev}."
+                        self.announce_voice(voice_en)
+
                 # Render Table
                 self.banner()
                 if table_data:
@@ -524,7 +805,7 @@ class AllCurrencyAndGoldNewsBot:
                     time.sleep(poll_sec)
                 else:
                     poll_sec = self.config["trading"].get("auto_poll_interval_seconds", 25)
-                    print(Fore.WHITE + f"\n[*] Monitoring All Currencies & War News ({len(self.subscribers)} Connected)...")
+                    print(Fore.WHITE + f"\n[*] Monitoring All Currencies & War News...")
                     time.sleep(poll_sec)
 
             except KeyboardInterrupt:

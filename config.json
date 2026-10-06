@@ -1,7 +1,13 @@
 {
   "discord": {
     "enabled": true,
+    "bot_token": "MTU1NzA2MjYzODY0NTY4MjM2Nw.GPmNnh.X3Gl2wVAlapyUK2LPB2DposD2nN3F6zd7xT6FE",
     "webhook_url": "https://discord.com/api/webhooks/1554164087225716882/09uhzYVps86mrAPCY1QjFAxZHe3ilCHtxT2e6noWoMar-0F06HkUsglghcNEgmHoGkvM",
+    "voice_enabled": true,
+    "voice_channel_id": "1535903253815099392",
+    "auto_join_voice": true,
+    "voice_language": "en",
+    "voice_name_en": "en-US-AriaNeural",
     "bot_name": "Sandun Madusanka (Trader/Fundamental Trader)",
     "avatar_url": "https://cdn.discordapp.com/avatars/1554164087225716882/b9f281dece62a511617dc918c5154d13.png"
   },
